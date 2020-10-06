@@ -4,6 +4,7 @@ const Mainloop = imports.mainloop;
 
 const Me = imports.misc.extensionUtils.getCurrentExtension();
 const Mullvad = Me.imports.mullvad;
+const Prefs = Me.imports.prefs;
 
 const Main = imports.ui.main;
 const AggregateMenu = Main.panel.statusArea.aggregateMenu;
@@ -49,16 +50,14 @@ const MullvadIndicator = GObject.registerClass({
         this._main();
     }
 
+    // Connect signals for preference changes
     _connectPrefSignals() {
         this._prefSignals = [];
 
-        // A list of prefs we want to immediately update the GUI for when changed
-        let prefs = ['show-icon', 'show-menu', 'show-server', 'show-country', 'show-city', 'show-type', 'show-ip'];
-
-        // Connect each signal to the updateGui function
-        for (let pref of prefs) {
+        // Refresh our menu whenever a setting is modified
+        for (const pref of Prefs.Settings) {
             this._prefSignals.push(this._settings.connect(
-                `changed::${pref}`,
+                `changed::${pref.key}`,
                 _setting => {
                     this._updateGui();
                 }
@@ -68,7 +67,7 @@ const MullvadIndicator = GObject.registerClass({
     }
 
     _disconnectPrefSignals() {
-        for (let signal of this._prefSignals)
+        for (const signal of this._prefSignals)
             this._settings.disconnect(signal);
     }
 
@@ -108,10 +107,13 @@ const MullvadIndicator = GObject.registerClass({
         this._settings.get_boolean('show-menu') ? this.menu.actor.show() : this.menu.actor.hide();
 
         // Update systray icon first
-        let icon = this._mullvad.connected ? ICON_CONNECTED : ICON_DISCONNECTED;
+        const icon = this._mullvad.connected ? ICON_CONNECTED : ICON_DISCONNECTED;
         this._indicator.gicon = Gio.icon_new_for_string(`${Me.path}/icons/${icon}.svg`);
         // Hide or unhide our systray icon
-        this._settings.get_boolean('show-icon') ? this._indicator.visible = true : this._indicator.visible = false;
+        if (this._settings.get_boolean('show-icon'))
+            this._indicator.visible = true;
+        else
+            this._indicator.visible = false;
 
         // Main item with the header section
         this._item = new PopupMenu.PopupSubMenuMenuItem(STATUS_STARTING, true);
@@ -124,14 +126,14 @@ const MullvadIndicator = GObject.registerClass({
         // Content Inside the box
         this._item.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
-        let detailedStatus = this._mullvad.detailed_status;
-        for (let item in detailedStatus) {
-            let title = detailedStatus[item].name;
-            let body = detailedStatus[item].text;
+        const detailedStatus = this._mullvad.detailed_status;
+        for (const item in detailedStatus) {
+            const title = detailedStatus[item].name;
+            const body = detailedStatus[item].text;
             // Don't add menu items for undefined or empty values
             if (body) {
-                let statusText = `${title}: ${body}`;
-                let menuItem = new PopupMenu.PopupMenuItem(statusText);
+                const statusText = `${title}: ${body}`;
+                const menuItem = new PopupMenu.PopupMenuItem(statusText);
                 this._item.menu.addMenuItem(menuItem);
             }
         }
@@ -143,19 +145,52 @@ const MullvadIndicator = GObject.registerClass({
         // Separator line
         this._item.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
 
+        // Connect/Disconnect menu item
+        const showConnectButton = this._settings.get_boolean('show-connect-button');
+        if (showConnectButton) {
+            const connectItem = this._makeConnectButton();
+            this._item.menu.addMenuItem(connectItem);
+        }
+
         // Manual refresh menu item
-        let refreshItem = new PopupMenu.PopupMenuItem(_('Refresh'));
+        const refreshItem = new PopupMenu.PopupMenuItem(_('Refresh'));
         refreshItem.actor.connect('button-press-event', () => {
             this._mullvad._pollMullvad();
         });
         this._item.menu.addMenuItem(refreshItem);
 
         // Settings menu item
-        let settingsItem = new PopupMenu.PopupMenuItem(_('Settings'));
+        const settingsItem = new PopupMenu.PopupMenuItem(_('Settings'));
         settingsItem.actor.connect('button-press-event', () => {
             Util.spawnCommandLine('gnome-extensions prefs mullvadindicator@pobega.github.com');
         });
         this._item.menu.addMenuItem(settingsItem);
+    }
+
+    _makeConnectButton() {
+        const connectLabel = this._mullvad.connected
+            ? _('Disconnect')
+            : _('Connect');
+
+        const connectCommandType = this._settings.get_string('connect-command-type');
+        const systemdService = this._settings.get_string('service-name');
+        let connectCommand;
+        if (connectCommandType === 'mullvad') {
+            connectCommand = this._mullvad.connected
+                ? 'mullvad disconnect'
+                : 'mullvad connect';
+        } else {
+            connectCommand = this._mullvad.connected
+                ? `systemctl stop ${systemdService}`
+                : `systemctl start ${systemdService}`;
+        }
+
+        const connectItem = new PopupMenu.PopupMenuItem(connectLabel);
+        connectItem.actor.connect('button-press-event', () => {
+            Util.spawnCommandLine(connectCommand);
+            this._mullvad._pollMullvad();
+        });
+        return connectItem;
     }
 
     _getNetworkMenuIndex() {
@@ -165,8 +200,8 @@ const MullvadIndicator = GObject.registerClass({
         // Return the current index of the networking menu in Gnome's
         // AggregateMenu. Normally defaults to '3' but other installed
         // extensions may adjust this index.
-        let menuItems = AggregateMenu.menu._getMenuItems();
-        let networkMenuIndex = menuItems.indexOf(AggregateMenu._network.menu) || 3;
+        const menuItems = AggregateMenu.menu._getMenuItems();
+        const networkMenuIndex = menuItems.indexOf(AggregateMenu._network.menu) || 3;
         return networkMenuIndex;
     }
 
@@ -177,7 +212,11 @@ const MullvadIndicator = GObject.registerClass({
             Mainloop.source_remove(this._timeout);
             this._timeout = null;
         }
-        const refreshTime = this._settings.get_int('refresh-time');
+        // We protect this from being set below 60 using a GtkAdjustment, but
+        // just in case the value somehow still goes below that we should
+        // default to 60 here (values less than 1 would cause huge CPU spikes
+        // and make this extension unusable)
+        const refreshTime = Math.max(this._settings.get_int('refresh-time'), 60);
         this._timeout = Mainloop.timeout_add_seconds(refreshTime, function () {
             this._main();
         }.bind(this));
